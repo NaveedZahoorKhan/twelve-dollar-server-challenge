@@ -112,12 +112,22 @@ func handleHealth(w http.ResponseWriter) {
 }
 
 func handleFeed(w http.ResponseWriter) {
+	buf, err := buildFeedJSON()
+	if err != nil {
+		writeError(w, 500, "internal server error")
+		return
+	}
+	writeJSON(w, 200, buf)
+}
+
+// buildFeedJSON runs the feed query on a pooled reader and returns the full
+// response body bytes.
+func buildFeedJSON() ([]byte, error) {
 	rd := <-readers
 	rows, err := rd.feed.Query(nil)
 	if err != nil {
 		readers <- rd
-		writeError(w, 500, "internal server error")
-		return
+		return nil, err
 	}
 	buf := make([]byte, 0, 8192)
 	buf = append(buf, `{"posts":[`...)
@@ -142,11 +152,10 @@ func handleFeed(w http.ResponseWriter) {
 	rows.Close()
 	readers <- rd
 	if err != nil {
-		writeError(w, 500, "internal server error")
-		return
+		return nil, err
 	}
 	buf = append(buf, ']', '}')
-	writeJSON(w, 200, buf)
+	return buf, nil
 }
 
 func handleGetPost(w http.ResponseWriter, idStr string) {

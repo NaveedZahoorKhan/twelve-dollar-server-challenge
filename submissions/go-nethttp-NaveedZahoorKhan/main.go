@@ -58,10 +58,9 @@ const (
 
 // reader bundles a raw connection and its long-lived prepared statements.
 type reader struct {
-	c      *sqlite3.SQLiteConn
-	feed   *sqlite3.SQLiteStmt
-	byID   *sqlite3.SQLiteStmt
-	exists *sqlite3.SQLiteStmt
+	c    *sqlite3.SQLiteConn
+	feed *sqlite3.SQLiteStmt
+	byID *sqlite3.SQLiteStmt
 }
 
 // writer bundles the single write connection and its prepared statements.
@@ -70,7 +69,6 @@ type writer struct {
 	c      *sqlite3.SQLiteConn
 	insP   *sqlite3.SQLiteStmt
 	insL   *sqlite3.SQLiteStmt
-	byID   *sqlite3.SQLiteStmt
 	exists *sqlite3.SQLiteStmt
 }
 
@@ -96,8 +94,8 @@ func openConn(path string, readonly bool) (*sqlite3.SQLiteConn, error) {
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA foreign_keys=OFF",
-		"PRAGMA cache_size=-16000", // ~16 MB per connection
-		"PRAGMA mmap_size=268435456", // 256 MB
+		"PRAGMA cache_size=-16000",    // ~16 MB page cache per connection
+		"PRAGMA mmap_size=1073741824", // 1 GB: maps the whole ~240 MB DB (+WAL) so reads are memory access, not pread() syscalls. mmap is a shared file mapping, not per-conn RAM.
 		"PRAGMA temp_store=MEMORY",
 	}
 	if readonly {
@@ -108,6 +106,11 @@ func openConn(path string, readonly bool) (*sqlite3.SQLiteConn, error) {
 			// journal_mode/synchronous may already be set; ignore benign errors
 			_ = err
 		}
+	}
+	// Let the planner use the seed's ANALYZE stats (sqlite_stat1) for this
+	// connection. Safe and cheap; it only refreshes/loads statistics.
+	if _, err := sc.Exec("PRAGMA optimize", nil); err != nil {
+		_ = err
 	}
 	return sc, nil
 }
@@ -130,7 +133,6 @@ func initDB(path string, nReaders int) error {
 		c:      wc,
 		insP:   prepare(wc, insertPostSQL),
 		insL:   prepare(wc, insertLikeSQL),
-		byID:   prepare(wc, postSQL),
 		exists: prepare(wc, existsSQL),
 	}
 
@@ -150,10 +152,9 @@ func initDB(path string, nReaders int) error {
 			return err
 		}
 		readers <- &reader{
-			c:      rc,
-			feed:   prepare(rc, feedSQL),
-			byID:   prepare(rc, postSQL),
-			exists: prepare(rc, existsSQL),
+			c:    rc,
+			feed: prepare(rc, feedSQL),
+			byID: prepare(rc, postSQL),
 		}
 	}
 	return nil
