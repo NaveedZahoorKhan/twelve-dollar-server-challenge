@@ -17,7 +17,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"net"
 	"net/http"
 	"os"
@@ -228,12 +227,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // JWT (HS256) — verified in full on every request
 // ---------------------------------------------------------------------------
 
-type claims struct {
-	Sub      json.RawMessage `json:"sub"`
-	Username json.RawMessage `json:"username"`
-	Exp      json.Number     `json:"exp"`
-}
-
 var b64 = base64.RawURLEncoding
 
 // parseAuth extracts and verifies the bearer token.
@@ -243,87 +236,65 @@ func parseAuth(authHeader string) (int64, string, int, string) {
 		return 0, "", 401, "missing bearer token"
 	}
 	tok := authHeader[len("Bearer "):]
-	parts := strings.Split(tok, ".")
-	if len(parts) != 3 {
+	// Split into exactly three dot-separated parts without allocating a slice.
+	d1 := strings.IndexByte(tok, '.')
+	if d1 < 0 {
 		return 0, "", 401, "invalid or expired token"
 	}
-	headerB, err := b64.DecodeString(parts[0])
+	d2 := strings.IndexByte(tok[d1+1:], '.')
+	if d2 < 0 {
+		return 0, "", 401, "invalid or expired token"
+	}
+	d2 += d1 + 1
+	// A fourth dot means malformed.
+	if strings.IndexByte(tok[d2+1:], '.') >= 0 {
+		return 0, "", 401, "invalid or expired token"
+	}
+	headPart := tok[:d1]
+	payPart := tok[d1+1 : d2]
+	sigPart := tok[d2+1:]
+
+	headerB, err := b64.DecodeString(headPart)
 	if err != nil {
 		return 0, "", 401, "invalid or expired token"
 	}
 	// alg must be HS256.
-	var hdr struct {
-		Alg string `json:"alg"`
-	}
-	if err := json.Unmarshal(headerB, &hdr); err != nil || hdr.Alg != "HS256" {
+	if alg, ok := jwtAlg(headerB); !ok || alg != "HS256" {
 		return 0, "", 401, "invalid or expired token"
 	}
 	// Verify signature over header.payload.
-	signingInput := parts[0] + "." + parts[1]
-	sig, err := b64.DecodeString(parts[2])
+	sig, err := b64.DecodeString(sigPart)
 	if err != nil {
 		return 0, "", 401, "invalid or expired token"
 	}
 	mac := hmac.New(sha256.New, jwtSecret)
-	mac.Write([]byte(signingInput))
+	mac.Write([]byte(tok[:d2])) // header.payload
 	expected := mac.Sum(nil)
 	if !hmac.Equal(sig, expected) {
 		return 0, "", 401, "invalid or expired token"
 	}
 	// Decode payload.
-	payloadB, err := b64.DecodeString(parts[1])
+	payloadB, err := b64.DecodeString(payPart)
 	if err != nil {
 		return 0, "", 401, "invalid or expired token"
 	}
-	var cl claims
-	if err := json.Unmarshal(payloadB, &cl); err != nil {
-		return 0, "", 401, "invalid or expired token"
-	}
-	// exp check.
-	expF, err := cl.Exp.Float64()
-	if err != nil {
-		return 0, "", 401, "invalid or expired token"
-	}
-	if int64(expF) <= time.Now().Unix() {
+	exp, expOK, subStr, subIsString, nameStr, nameIsString := payloadFields(payloadB)
+	// exp check (missing or non-numeric exp is an invalid token).
+	if !expOK || exp <= time.Now().Unix() {
 		return 0, "", 401, "invalid or expired token"
 	}
 	// Payload validity: sub must be a positive-integer STRING, username a string.
-	uid, ok := subToPositiveInt(cl.Sub)
-	if !ok {
+	if !subIsString {
 		return 0, "", 401, "invalid token payload"
 	}
-	username, ok := rawToString(cl.Username)
-	if !ok {
+	uid, err := strconv.ParseInt(subStr, 10, 64)
+	if err != nil || uid <= 0 {
 		return 0, "", 401, "invalid token payload"
 	}
-	return uid, username, 0, ""
-}
-
-// subToPositiveInt accepts a JSON string containing a positive integer.
-func subToPositiveInt(raw json.RawMessage) (int64, bool) {
-	if len(raw) == 0 {
-		return 0, false
+	if !nameIsString {
+		return 0, "", 401, "invalid token payload"
 	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return 0, false
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || n <= 0 {
-		return 0, false
-	}
-	return n, true
-}
-
-func rawToString(raw json.RawMessage) (string, bool) {
-	if len(raw) == 0 {
-		return "", false
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return "", false
-	}
-	return s, true
+	return uid, nameStr, 0, ""
 }
 
 // ---------------------------------------------------------------------------
