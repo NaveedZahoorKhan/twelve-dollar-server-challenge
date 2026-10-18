@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # start.sh — runs the server in the foreground. Configured only by SPEC env vars
-# (SQLITE_PATH, JWT_SECRET, HOST, PORT). We run behind Nginx on 127.0.0.1:3000.
+# (SQLITE_PATH, JWT_SECRET, HOST, PORT). We serve the internet DIRECTLY (no
+# Nginx): the benchmark sets HOST=0.0.0.0, PORT=80 and the server binds those.
 set -euo pipefail
 cd "$(dirname "$0")"
 

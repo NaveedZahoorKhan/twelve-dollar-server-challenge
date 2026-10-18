@@ -1,6 +1,6 @@
 // A small feed API on SQLite for the $12 server challenge.
 //
-// Design for 1 vCPU / 2 GB behind Nginx:
+// Design for 1 vCPU / 2 GB, serving the internet directly (no Nginx):
 //   - net/http keep-alive server (goroutine per connection is cheap in Go).
 //   - A pool of read-only SQLite connections (WAL => concurrent readers),
 //     each with its own cached prepared statements (query-plan cache only).
@@ -357,7 +357,7 @@ func main() {
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  75 * time.Second, // keep idle conns > 65 s (Nginx reuse, rule in SPEC)
+		IdleTimeout:  75 * time.Second, // outlive a VU's 5-15 s think-time so the keep-alive conn isn't recycled mid-loop
 	}
 	if err := srv.Serve(ln); err != nil {
 		panic(err)

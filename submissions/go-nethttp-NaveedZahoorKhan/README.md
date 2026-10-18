@@ -10,7 +10,7 @@ A feed API on SQLite, tuned for the $12 box (1 vCPU, 2 GB).
 | HTTP | the standard library `net/http` server, HTTP/1.1 keep-alive |
 | SQLite driver | `github.com/mattn/go-sqlite3` v1.14.22 (cgo) |
 | SQLite | the amalgamation vendored **inside** go-sqlite3, compiled from source by `build.sh` — so the SQLite version is pinned by the driver, not by whatever `libsqlite3` the box happens to have |
-| Nginx or direct | **Behind Nginx** on `127.0.0.1:3000` (same as the languages video) |
+| Nginx or direct | **Direct** — the server binds `0.0.0.0:80` and handles keep-alive connections itself (no Nginx). See "Direct, not Nginx" below. |
 
 Dependencies are vendored (`vendor/`), so `build.sh` needs no network and always
 compiles the same code.
@@ -60,13 +60,33 @@ only shrink our own binary's SQLite — no box tuning.
 - Post ids are validated by hand (digits only, positive), so `0`, `-1`, `abc`
   and `1.5` are rejected as `invalid post id` without touching the database.
 
-**Keep-alive.** `IdleTimeout` is 75 s so idle upstream connections outlive
-Nginx's 65 s reuse window and Nginx never races a socket we just closed.
+**Keep-alive.** `IdleTimeout` is 75 s so a VU's connection survives its 5–15 s
+think-time without being recycled mid-loop.
 
 **Runtime.** `GOMAXPROCS=2` (default, override via env): one core for the box,
 but a second P lets the Go scheduler overlap a blocking cgo/SQLite call with
 network I/O instead of stalling the whole server. `READERS` is tunable the same
 way.
+
+## Direct, not Nginx
+
+Go's `net/http` holds tens of thousands of idle keep-alive connections cheaply
+(a goroutine plus a few KB each), so serving the internet directly skips the
+14–20 % of the single core that Nginx would burn and removes Nginx's
+`keepalive 64` upstream pool as a bottleneck.
+
+Measured in a Docker container pinned to the droplet's limits
+(`--cpus=1 --memory=2g --memory-swap=2g`), with k6 running `bench/load.js`:
+
+| VUs | Nginx mode | Direct mode |
+|----:|---|---|
+| 20k | pass, p99 46 ms, CPU ~80 % | pass, p99 **1.96 ms**, CPU ~35 % |
+| 25k | — | pass, p99 **2.35 ms**, CPU ~40 %, 0 errors |
+
+Direct mode cut p99 ~20× and CPU roughly in half, and never exceeded ~40 % CPU
+or ~875 MB / 2 GB at 25k users — plenty of headroom. (These are indicative:
+k6 shared the host with the container and short holds were used; the official
+score comes from 5-minute holds on the droplet with k6 on a separate machine.)
 
 ## Correctness
 
