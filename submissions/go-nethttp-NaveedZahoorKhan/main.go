@@ -16,7 +16,9 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql/driver"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -84,8 +86,12 @@ var (
 
 func openConn(path string, readonly bool) (*sqlite3.SQLiteConn, error) {
 	d := &sqlite3.SQLiteDriver{}
-	dsn := path
-	// Open via the driver's Open to get a *SQLiteConn.
+	// _mutex=no: skip SQLite's per-connection mutex. Safe because each
+	// connection is owned by exactly one goroutine at a time (reader pool hands
+	// a connection to one request; single writer goroutine; dedicated health
+	// conn). Built with SQLITE_THREADSAFE=2 (multi-thread). This drops locking
+	// overhead from every SQLite call.
+	dsn := path + "?_mutex=no"
 	conn, err := d.Open(dsn)
 	if err != nil {
 		return nil, err
@@ -114,7 +120,68 @@ func openConn(path string, readonly bool) (*sqlite3.SQLiteConn, error) {
 	if _, err := sc.Exec("PRAGMA optimize", nil); err != nil {
 		_ = err
 	}
+	// Verify durability settings actually took (rule 6): WAL + synchronous>=1.
+	if err := verifyDurable(sc); err != nil {
+		sc.Close()
+		return nil, err
+	}
 	return sc, nil
+}
+
+// verifyDurable confirms the connection is in WAL with synchronous at least
+// NORMAL (1). Fails fast at startup rather than silently serving non-durable
+// writes.
+func verifyDurable(sc *sqlite3.SQLiteConn) error {
+	jm, err := scalarString(sc, "PRAGMA journal_mode")
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(jm, "wal") {
+		return fmt.Errorf("journal_mode is %q, want wal", jm)
+	}
+	sy, err := scalarInt(sc, "PRAGMA synchronous")
+	if err != nil {
+		return err
+	}
+	if sy < 1 {
+		return fmt.Errorf("synchronous is %d, want >=1 (NORMAL)", sy)
+	}
+	return nil
+}
+
+func scalarString(sc *sqlite3.SQLiteConn, q string) (string, error) {
+	rows, err := sc.Query(q, nil)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		return "", err
+	}
+	switch v := dest[0].(type) {
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	}
+	return "", fmt.Errorf("unexpected type for %s", q)
+}
+
+func scalarInt(sc *sqlite3.SQLiteConn, q string) (int64, error) {
+	rows, err := sc.Query(q, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		return 0, err
+	}
+	if n, ok := dest[0].(int64); ok {
+		return n, nil
+	}
+	return 0, fmt.Errorf("unexpected type for %s", q)
 }
 
 func prepare(c *sqlite3.SQLiteConn, q string) *sqlite3.SQLiteStmt {
