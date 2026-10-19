@@ -6,17 +6,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 // postRow holds one projected post row.
-type postRow struct {
-	id        int64
-	body      string
-	createdAt string
-	author    string
-	likeCount int64
-}
-
 func asInt(v driver.Value) int64 {
 	switch n := v.(type) {
 	case int64:
@@ -35,16 +29,6 @@ func asStr(v driver.Value) string {
 		return string(s)
 	}
 	return ""
-}
-
-func rowFromDest(dest []driver.Value) postRow {
-	return postRow{
-		id:        asInt(dest[0]),
-		body:      asStr(dest[1]),
-		createdAt: asStr(dest[2]),
-		author:    asStr(dest[3]),
-		likeCount: asInt(dest[4]),
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -121,35 +105,35 @@ func handleFeed(w http.ResponseWriter) {
 }
 
 // buildFeedJSON runs the feed query on a pooled reader and returns the full
-// response body bytes.
+// response body bytes. Uses the batched single-cgo-call row reader (StepPost5)
+// to avoid per-column cgo crossings and driver.Value boxing on the hot path.
 func buildFeedJSON() ([]byte, error) {
 	rd := <-readers
-	rows, err := rd.feed.Query(nil)
-	if err != nil {
+	if err := rd.feed.ResetStmt(); err != nil {
 		readers <- rd
 		return nil, err
 	}
 	buf := make([]byte, 0, 8192)
 	buf = append(buf, `{"posts":[`...)
-	dest := make([]driver.Value, 5)
 	first := true
+	var err error
 	for {
-		e := rows.Next(dest)
-		if e == io.EOF {
-			break
-		}
+		row, ok, e := rd.feed.StepPost5()
 		if e != nil {
 			err = e
+			break
+		}
+		if !ok {
 			break
 		}
 		if !first {
 			buf = append(buf, ',')
 		}
 		first = false
-		r := rowFromDest(dest)
-		buf = appendPost(buf, r.id, r.body, r.createdAt, r.author, r.likeCount)
+		buf = appendPost(buf, row.ID, row.Body, row.CreatedAt, row.Author, row.LikeCount)
 	}
-	rows.Close()
+	// Reset so the statement is clean for the next borrower (also releases locks).
+	_ = rd.feed.ResetStmt()
 	readers <- rd
 	if err != nil {
 		return nil, err
@@ -165,21 +149,16 @@ func handleGetPost(w http.ResponseWriter, idStr string) {
 		return
 	}
 	rd := <-readers
-	rows, err := rd.byID.Query([]driver.Value{id})
 	var (
 		found bool
-		row   postRow
+		row   sqlite3.PostRow
+		err   error
 	)
-	if err == nil {
-		dest := make([]driver.Value, 5)
-		e := rows.Next(dest)
-		if e == nil {
-			found = true
-			row = rowFromDest(dest)
-		} else if e != io.EOF {
-			err = e
-		}
-		rows.Close()
+	if e := rd.byID.BindInt1Reset(id); e != nil {
+		err = e
+	} else {
+		row, found, err = rd.byID.StepPost5()
+		_ = rd.byID.ResetStmt()
 	}
 	readers <- rd
 	if err != nil {
@@ -190,9 +169,9 @@ func handleGetPost(w http.ResponseWriter, idStr string) {
 		writeError(w, 404, "post not found")
 		return
 	}
-	buf := make([]byte, 0, 256+len(row.body))
+	buf := make([]byte, 0, 256+len(row.Body))
 	buf = append(buf, `{"post":`...)
-	buf = appendPost(buf, row.id, row.body, row.createdAt, row.author, row.likeCount)
+	buf = appendPost(buf, row.ID, row.Body, row.CreatedAt, row.Author, row.LikeCount)
 	buf = append(buf, '}')
 	writeJSON(w, 200, buf)
 }
@@ -219,31 +198,15 @@ func handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wr.mu.Lock()
-	rows, err := wr.insP.Query([]driver.Value{uid, body})
-	var (
-		newID     int64
-		createdAt string
-	)
-	if err == nil {
-		dest := make([]driver.Value, 2)
-		e := rows.Next(dest)
-		if e == nil {
-			newID = asInt(dest[0])
-			createdAt = asStr(dest[1])
-		} else {
-			err = e
-		}
-		rows.Close()
-	}
-	wr.mu.Unlock()
-	if err != nil {
+	rq := &writeReq{kind: kindPost, uid: uid, body: body}
+	wr.submit(rq)
+	if rq.err != nil {
 		writeError(w, 500, "internal server error")
 		return
 	}
 	buf := make([]byte, 0, 256+len(body))
 	buf = append(buf, `{"post":`...)
-	buf = appendPost(buf, newID, body, createdAt, username, 0)
+	buf = appendPost(buf, rq.newID, body, rq.createdAt, username, 0)
 	buf = append(buf, '}')
 	writeJSON(w, 201, buf)
 }
@@ -261,44 +224,19 @@ func handleLike(w http.ResponseWriter, r *http.Request, idStr string) {
 		return
 	}
 
-	wr.mu.Lock()
-	// Does the post exist?
-	exRows, err := wr.exists.Query([]driver.Value{id})
-	exists := false
-	if err == nil {
-		dest := make([]driver.Value, 1)
-		if e := exRows.Next(dest); e == nil {
-			exists = true
-		} else if e != io.EOF {
-			err = e
-		}
-		exRows.Close()
-	}
-	if err != nil {
-		wr.mu.Unlock()
+	rq := &writeReq{kind: kindLike, uid: uid, postID: id}
+	wr.submit(rq)
+	if rq.err != nil {
 		writeError(w, 500, "internal server error")
 		return
 	}
-	if !exists {
-		wr.mu.Unlock()
+	if rq.notFound {
 		writeError(w, 404, "post not found")
-		return
-	}
-	// Insert like; detect whether it was new via changes().
-	res, err := wr.insL.Exec([]driver.Value{uid, id})
-	alreadyLiked := false
-	if err == nil {
-		n, _ := res.RowsAffected()
-		alreadyLiked = n == 0
-	}
-	wr.mu.Unlock()
-	if err != nil {
-		writeError(w, 500, "internal server error")
 		return
 	}
 	buf := make([]byte, 0, 64)
 	buf = append(buf, `{"liked":true,"already_liked":`...)
-	if alreadyLiked {
+	if rq.alreadyLiked {
 		buf = append(buf, "true"...)
 	} else {
 		buf = append(buf, "false"...)
@@ -307,7 +245,7 @@ func handleLike(w http.ResponseWriter, r *http.Request, idStr string) {
 	buf = strconv.AppendInt(buf, id, 10)
 	buf = append(buf, '}')
 	status = 201
-	if alreadyLiked {
+	if rq.alreadyLiked {
 		status = 200
 	}
 	writeJSON(w, status, buf)

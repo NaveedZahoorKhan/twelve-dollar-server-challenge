@@ -64,11 +64,14 @@ type reader struct {
 
 // writer bundles the single write connection and its prepared statements.
 type writer struct {
-	mu     sync.Mutex
 	c      *sqlite3.SQLiteConn
 	insP   *sqlite3.SQLiteStmt
 	insL   *sqlite3.SQLiteStmt
 	exists *sqlite3.SQLiteStmt
+	begin  *sqlite3.SQLiteStmt
+	commit *sqlite3.SQLiteStmt
+	rbck   *sqlite3.SQLiteStmt
+	reqs   chan *writeReq // group-commit queue
 }
 
 var (
@@ -133,7 +136,12 @@ func initDB(path string, nReaders int) error {
 		insP:   prepare(wc, insertPostSQL),
 		insL:   prepare(wc, insertLikeSQL),
 		exists: prepare(wc, existsSQL),
+		begin:  prepare(wc, "BEGIN IMMEDIATE"),
+		commit: prepare(wc, "COMMIT"),
+		rbck:   prepare(wc, "ROLLBACK"),
+		reqs:   make(chan *writeReq, 1024),
 	}
+	go wr.run()
 
 	// Health connection (its own, so it never contends with the pool).
 	hc, err := openConn(path, true)
