@@ -96,24 +96,27 @@ func handleHealth(w http.ResponseWriter) {
 }
 
 func handleFeed(w http.ResponseWriter) {
-	buf, err := buildFeedJSON()
+	bp := getBuf()
+	defer putBuf(bp)
+	out, err := buildFeedJSON((*bp)[:0])
 	if err != nil {
 		writeError(w, 500, "internal server error")
 		return
 	}
-	writeJSON(w, 200, buf)
+	*bp = out // keep cap for return to pool
+	writeJSON(w, 200, out)
 }
 
-// buildFeedJSON runs the feed query on a pooled reader and returns the full
-// response body bytes. Uses the batched single-cgo-call row reader (StepPost5)
-// to avoid per-column cgo crossings and driver.Value boxing on the hot path.
-func buildFeedJSON() ([]byte, error) {
+// buildFeedJSON runs the feed query on a pooled reader and appends the full
+// response body into buf (which the caller owns, typically from the pool).
+// Uses the batched single-cgo-call row reader (StepPost5) to avoid per-column
+// cgo crossings and driver.Value boxing on the hot path.
+func buildFeedJSON(buf []byte) ([]byte, error) {
 	rd := <-readers
 	if err := rd.feed.ResetStmt(); err != nil {
 		readers <- rd
 		return nil, err
 	}
-	buf := make([]byte, 0, 8192)
 	buf = append(buf, `{"posts":[`...)
 	first := true
 	var err error
@@ -169,10 +172,12 @@ func handleGetPost(w http.ResponseWriter, idStr string) {
 		writeError(w, 404, "post not found")
 		return
 	}
-	buf := make([]byte, 0, 256+len(row.Body))
-	buf = append(buf, `{"post":`...)
+	bp := getBuf()
+	defer putBuf(bp)
+	buf := append((*bp)[:0], `{"post":`...)
 	buf = appendPost(buf, row.ID, row.Body, row.CreatedAt, row.Author, row.LikeCount)
 	buf = append(buf, '}')
+	*bp = buf
 	writeJSON(w, 200, buf)
 }
 

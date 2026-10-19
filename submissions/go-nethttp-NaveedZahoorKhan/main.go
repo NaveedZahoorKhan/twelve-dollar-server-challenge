@@ -219,8 +219,35 @@ func appendJSONString(b []byte, s string) []byte {
 func writeJSON(w http.ResponseWriter, status int, body []byte) {
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
+	// Explicit Content-Length avoids chunked transfer-encoding for these small
+	// fixed-size bodies (one less framing layer, fewer writes).
+	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
 	w.Write(body)
+}
+
+// Response-buffer pool. We reuse empty scratch byte slices to cut per-request
+// allocations and GC work. Only the empty buffer is reused — never response
+// data or query results (rule 5): each response is freshly built from a live
+// read every request.
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 24*1024) // feed is the largest (~20 KB)
+		return &b
+	},
+}
+
+func getBuf() *[]byte {
+	bp := bufPool.Get().(*[]byte)
+	*bp = (*bp)[:0]
+	return bp
+}
+
+func putBuf(bp *[]byte) {
+	// Drop oversized buffers so the pool doesn't retain giant allocations.
+	if cap(*bp) <= 64*1024 {
+		bufPool.Put(bp)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
